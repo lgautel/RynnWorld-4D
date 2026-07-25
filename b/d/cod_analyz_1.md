@@ -1698,6 +1698,710 @@ ZeRO-2 仅分片优化器状态和梯度，不分片模型参数。配合 CPU of
 
 ---
 
+## 10. 训练数据与 Loss 计算深入分析
+
+本章基于实际代码逐行分析 RynnWorld-4D（世界模型）和 RynnWorld-4D-Policy（策略头）在训练时使用的数据、数据格式、数据处理代码和 loss 计算逻辑。
+
+### 10.1 World Model 训练数据
+
+#### 10.1.1 数据总览
+
+World Model 使用**预计算的 VAE 潜变量**（而非原始视频像素）进行训练。整个数据流程分为两个阶段：
+
+```mermaid
+flowchart LR
+    subgraph "离线预处理 (utils/pre-process.py)"
+        RAW_RGB["原始 RGB 视频"] --> VAE_E["Wan VAE Encoder"]
+        RAW_DEPTH["深度视频 (DA3)"] --> VAE_E
+        RAW_FLOW["光流视频 (DPFlow)"] --> VAE_E
+        RAW_TEXT["文本描述 (Qwen3-VL)"] --> T5_E["UMT5 Encoder"]
+        
+        VAE_E --> SF_RGB["rgb_latents.safetensors"]
+        VAE_E --> SF_FD["flow_depth_latents.safetensors"]
+        T5_E --> SF_RGB
+    end
+    
+    subgraph "在线训练 (RynnWorld4DDataset)"
+        JSON["JSON Manifest"] --> DS["Dataset.__getitem__"]
+        SF_RGB --> DS
+        SF_FD --> DS
+        DS --> BATCH["Training Batch"]
+    end
+```
+
+#### 10.1.2 原始数据预处理：`utils/pre-process.py`
+
+> 源码位置：`utils/pre-process.py`，`PreProcess` 类
+
+**视频读取与变换**：
+
+1. 使用 `decord.VideoReader` 读取视频（支持 H.264 转码回退）
+2. 缩放到目标分辨率（短边匹配），然后 `CenterCrop((height, width))`
+3. 像素归一化：$\text{pixel} \in [0, 255] \to [-1.0, 1.0]$（通过 `x / 255.0 * 2.0 - 1.0`）
+4. 长视频分块：按 `max_num_frames` 切分，短于 40 帧的余段丢弃
+
+**光流视频特殊处理**：
+- 光流视频有 $N-1$ 帧（相邻帧对），代码在前面补一帧全白帧（像素值 255，即归一化后 +1.0），表示零光流（Middlebury 颜色编码约定）
+
+**VAE 编码**（`encode_video` 方法）：
+
+```python
+# 伪代码（基于 pre-process.py 约 440-450 行）
+video_input = frames.permute(1,0,2,3).unsqueeze(0)        # [1, C, T, H, W]
+video_latents = vae.encode(video_input).latent_dist.mode() # 使用 mode() 而非 sample()
+
+# 潜变量标准化（per-channel z-score）
+latents_mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1)
+latents_std  = torch.tensor(vae.config.latents_std).view(1, -1, 1, 1, 1)
+video_latents = (video_latents - latents_mean) / latents_std
+```
+
+三个模态（RGB/深度/光流）**共用同一个 VAE 编码器和相同的 `latents_mean`/`latents_std` 标准化参数**。
+
+**文本编码**（`_get_t5_prompt_embeds` 方法）：
+- 文本清理：`ftfy.fix_text` + `html.unescape` + 去除多余空白
+- 使用 `T5TokenizerFast` + `UMT5EncoderModel`，最大序列长度 226（默认），零填充
+- 输出形状：`(1, max_seq_len, 4096)`
+
+#### 10.1.3 数据清单格式：JSON Manifest
+
+> 样例文件：`data/sample.json`
+
+```json
+[
+  {
+    "rgb_latents": "data/sample_latents/agibot_0_rgb.safetensors",
+    "flow_depth_latents": "data/sample_latents/agibot_0_flow_depth.safetensors",
+    "prompt": "The robot uses its left arm to pick up a red apple ..."
+  },
+  ...
+]
+```
+
+每个条目代表一个视频片段。训练时只需 `rgb_latents` 和 `flow_depth_latents` 两个路径（`prompt` 字段仅供参考，实际文本嵌入已编码在 safetensors 中）。
+
+#### 10.1.4 Safetensors 文件内容
+
+| 文件类型 | 键名 | 形状 | 说明 |
+|---------|------|------|------|
+| RGB safetensors | `video_latents` | `[C_z, T_{lat}, H_{lat}, W_{lat}]` | VAE 编码后的 RGB 潜变量，$C_z=16$ |
+| | `text_embeds` | `[1, seq_{len}, 4096]` | UMT5 文本嵌入 |
+| Flow/Depth safetensors | `depth_latents` | `[C_z, T_{lat}, H_{lat}, W_{lat}]` | VAE 编码后的深度潜变量 |
+| | `flow_latents` | `[C_z, T_{lat}, H_{lat}, W_{lat}]` | VAE 编码后的光流潜变量 |
+
+其中维度关系：
+- $C_z = 16$（Wan VAE 潜变量通道数）
+- $T_{lat} = (T_{raw} - 1) / 4 + 1$（Causal VAE 4x 时间压缩，如 81 帧 → 21 帧）
+- $H_{lat} = H / 8$，$W_{lat} = W / 8$（8x 空间压缩）
+
+**三个模态的潜变量形状完全相同**，因为它们来自相同分辨率和帧数的视频，经过同一个 VAE 编码器。
+
+#### 10.1.5 `RynnWorld4DDataset.__getitem__` 详解
+
+> 源码位置：`core/finetune/datasets/wan_dataset.py:107-158`
+
+每个样本的加载流程：
+
+```mermaid
+flowchart TB
+    IDX["idx"] --> LOAD_RGB["加载 rgb_latents.safetensors<br/>(含 5 次重试, 间隔 1s)"]
+    IDX --> LOAD_FD["加载 flow_depth_latents.safetensors<br/>(含 5 次重试, 间隔 1s)"]
+    
+    LOAD_RGB --> EXTRACT_RGB["video_latents: [C, T, H, W]<br/>text_embeds: squeeze → [seq, dim]"]
+    LOAD_FD --> EXTRACT_FD["depth_latents: [C, T, H, W]<br/>flow_latents: [C, T, H, W]"]
+    
+    EXTRACT_RGB --> CHECK["形状一致性检查<br/>depth.shape == video.shape?<br/>flow.shape == video.shape?"]
+    EXTRACT_FD --> CHECK
+    
+    CHECK -->|"不匹配"| FALLBACK["回退到随机样本"]
+    CHECK -->|"匹配"| FIRST_FRAME["提取首帧潜变量<br/>img_latent = video[:, :1, :, :]<br/>depth_latent = depth[:, :1, :, :]<br/>flow_latent = flow[:, :1, :, :]"]
+    
+    FIRST_FRAME --> RETURN["返回 8 个张量的字典"]
+```
+
+**返回字典的完整内容**：
+
+| 键名 | 形状 | 来源 | 训练中的用途 |
+|------|------|------|------------|
+| `encoded_video` | `[C, T, H, W]` | RGB safetensors | 三分支 video 的干净潜变量（$z_0^{video}$） |
+| `encoded_depth` | `[C, T, H, W]` | Flow/Depth safetensors | 三分支 depth 的干净潜变量（$z_0^{depth}$） |
+| `encoded_flow` | `[C, T, H, W]` | Flow/Depth safetensors | 三分支 flow 的干净潜变量（$z_0^{flow}$） |
+| `img_latent` | `[C, 1, H, W]` | `encoded_video[:, :1]` | RGB 首帧条件（Image-to-Video） |
+| `depth_latent` | `[C, 1, H, W]` | `encoded_depth[:, :1]` | 深度首帧条件 |
+| `flow_latent` | `[C, 1, H, W]` | `encoded_flow[:, :1]` | 光流首帧条件（零光流的白色图编码） |
+| `null_embedding` | `[seq, dim]` | 预计算的空文本嵌入 | CFG dropout 时替换真实文本 |
+| `text_embedding` | `[seq, dim]` | RGB safetensors 中的 `text_embeds` | 文本条件信号 |
+
+**Collate 函数**（`rynnworld4d_trainer.py:714-746`）：对每个键执行 `torch.stack`，将上述字典中的每个张量在 batch 维度堆叠，如 `encoded_videos: [B, C, T, H, W]`。
+
+### 10.2 World Model Loss 计算
+
+> 源码位置：`core/finetune/models/wan_i2v/rynnworld4d_trainer.py:796-915`，`compute_loss` 方法
+
+这是 RynnWorld-4D 训练的核心函数。下面逐步解析其完整实现，精确标注每一步使用了训练数据中的哪些信息。
+
+#### 10.2.1 完整流程图
+
+```mermaid
+flowchart TB
+    subgraph "Step 1: 从 batch 提取数据"
+        B_VID["encoded_videos<br/>[B,C,T,H,W]"]
+        B_DEPTH["encoded_depth<br/>[B,C,T,H,W]"]
+        B_FLOW["encoded_flow<br/>[B,C,T,H,W]"]
+        B_IMG["img_latent<br/>[B,C,1,H,W]"]
+        B_DLAT["depth_latent<br/>[B,C,1,H,W]"]
+        B_FLAT["flow_latent<br/>[B,C,1,H,W]"]
+        B_NULL["null_embedding<br/>[B,seq,dim]"]
+        B_TEXT["text_embedding<br/>[B,seq,dim]"]
+    end
+    
+    subgraph "Step 2: 共享噪声采样"
+        NOISE["noise_video = randn_like(video)"]
+        NOISE --> CLONE_D["noise_depth = noise_video.clone()"]
+        NOISE --> CLONE_F["noise_flow = noise_video.clone()"]
+    end
+    
+    subgraph "Step 3: 时间步采样 + Flow-shift"
+        T_SAMP["t ~ U{0, ..., T-1}"]
+        T_SAMP --> SIGMA["σ_t = shift·s / (1+(shift-1)·s)"]
+    end
+    
+    subgraph "Step 4: 构建噪声潜变量"
+        B_VID --> NOISY_V["noisy_v = (1-σ)·video + σ·noise"]
+        B_DEPTH --> NOISY_D["noisy_d = (1-σ)·depth + σ·noise"]
+        B_FLOW --> NOISY_F["noisy_f = (1-σ)·flow + σ·noise"]
+    end
+    
+    subgraph "Step 5: 计算目标"
+        TARGET_V["target_v = noise - video"]
+        TARGET_D["target_d = noise - depth"]
+        TARGET_F["target_f = noise - flow"]
+    end
+    
+    subgraph "Step 6: 首帧替换"
+        B_IMG --> REPLACE_V["noisy_v[:,:,0:1] = img_latent"]
+        B_DLAT --> REPLACE_D["noisy_d[:,:,0:1] = depth_latent"]
+        B_FLAT --> REPLACE_F["noisy_f[:,:,0:1] = flow_latent"]
+    end
+    
+    subgraph "Step 7: Branch Dropout"
+        BD["p < branch_dropout_prob?"]
+        BD -->|"是"| BD_CHOOSE["随机选 depth 或 flow"]
+        BD_CHOOSE --> BD_APPLY["选中分支 frame[1:] = randn(...)"]
+    end
+    
+    subgraph "Step 8: CFG Dropout"
+        CFG["p < 0.15?"]
+        CFG -->|"是"| CFG_APPLY["text_emb = null_embedding"]
+        B_TEXT --> CFG
+        B_NULL --> CFG_APPLY
+    end
+    
+    subgraph "Step 9: 构建 per-token timestep"
+        PER_TOK["frame[0] → timestep=0<br/>frame[1:] → timestep=σ_t·T"]
+    end
+    
+    subgraph "Step 10: Transformer 前向"
+        FORWARD["model(noisy_v, noisy_d, noisy_f,<br/>timestep, text_emb)"]
+        FORWARD --> PRED_V["pred_video"]
+        FORWARD --> PRED_D["pred_depth"]
+        FORWARD --> PRED_F["pred_flow"]
+    end
+    
+    subgraph "Step 11: 计算 Loss"
+        LOSS_V["loss_v = MSE(pred_v[:,1:], target_v[:,1:])"]
+        LOSS_D["loss_d = MSE(pred_d[:,1:], target_d[:,1:])"]
+        LOSS_F["loss_f = MSE(pred_f[:,1:], target_f[:,1:])"]
+        TOTAL["loss = loss_v + loss_d + λ_flow · loss_f"]
+    end
+    
+    NOISY_V --> BD
+    NOISY_D --> BD
+    NOISY_F --> BD
+    
+    BD --> FORWARD
+    CFG --> FORWARD
+    PER_TOK --> FORWARD
+    
+    TARGET_V --> LOSS_V
+    TARGET_D --> LOSS_D
+    TARGET_F --> LOSS_F
+    PRED_V --> LOSS_V
+    PRED_D --> LOSS_D
+    PRED_F --> LOSS_F
+    LOSS_V --> TOTAL
+    LOSS_D --> TOTAL
+    LOSS_F --> TOTAL
+```
+
+#### 10.2.2 逐步代码解析
+
+**Step 1：提取 batch 数据**（约第 797-813 行）
+
+```python
+video_latent       = batch["encoded_videos"].to(model_dtype)   # 干净 RGB 潜变量
+depth_video_latent = batch["encoded_depth"].to(model_dtype)    # 干净深度潜变量
+flow_video_latent  = batch["encoded_flow"].to(model_dtype)     # 干净光流潜变量
+img_latent         = batch["img_latent"].to(model_dtype)       # RGB 首帧条件
+depth_latent       = batch["depth_latent"].to(model_dtype)     # 深度首帧条件
+flow_latent        = batch["flow_latent"].to(model_dtype)      # 光流首帧条件
+null_embedding     = batch["null_embedding"].to(model_dtype)   # 空文本嵌入
+text_embedding     = batch["text_embedding"].to(model_dtype)   # 真实文本嵌入
+```
+
+**全部 8 个字段都被使用**，每个字段在后续步骤中都有明确用途。
+
+**Step 2：共享噪声采样**（约第 821-823 行）
+
+```python
+noise_video = torch.randn_like(video_latent)
+noise_depth = noise_video.clone()   # 深度使用完全相同的噪声
+noise_flow  = noise_video.clone()   # 光流使用完全相同的噪声
+```
+
+三个分支使用**完全相同的噪声**。这是关键设计决策——共享噪声对齐了三个分支的去噪轨迹，使 Joint Cross-Modal Attention 可以在一致的信噪比水平下进行特征交互。
+
+**Step 3：时间步采样与 Flow-shift 调度**（约第 825-836 行）
+
+$$s = \frac{t_{idx}}{T}, \quad \sigma_t = \frac{s \cdot \text{shift}}{1 + (\text{shift} - 1) \cdot s}$$
+
+其中 $\text{shift}$ 为 Wan 调度器的 `flow_shift` 参数（默认 5.0）。这个非线性映射将均匀采样的 $s \in [0,1]$ 偏向更高噪声水平。
+
+**Step 4：构建噪声潜变量**（约第 838-840 行）
+
+$$z_t^m = (1 - \sigma_t) z_0^m + \sigma_t \epsilon, \quad m \in \{\text{video, depth, flow}\}$$
+
+这是标准的 Flow Matching / Rectified Flow 线性插值路径。
+
+**Step 5：计算速度目标**（约第 842-844 行）
+
+$$v_{target}^m = \epsilon - z_0^m$$
+
+速度方向从干净数据指向噪声（"noise minus clean"），即沿插值路径的前进方向。
+
+**Step 6：首帧条件替换**（约第 846-848 行）
+
+```python
+noisy_latents[:, :, 0:1, :, :]       = img_latent      # 使用 img_latent
+noisy_latents_depth[:, :, 0:1, :, :] = depth_latent    # 使用 depth_latent
+noisy_latents_flow[:, :, 0:1, :, :]  = flow_latent     # 使用 flow_latent
+```
+
+将每个分支的第 0 帧替换为**干净的首帧潜变量**。这实现了 Image-to-Video 条件注入——模型始终看到干净的首帧，只需预测后续帧。这里直接使用了 dataset 中预提取的 `img_latent`、`depth_latent`、`flow_latent`。
+
+**Step 7：Branch Dropout**（约第 853-864 行）
+
+```python
+if branch_dropout_prob > 0:
+    allowed_modes = [m for m in branch_dropout_modes if m != 'video']
+    # 'video' 永远不被 dropout（RGB 是外观锚点）
+    if allowed_modes and random.random() < branch_dropout_prob:
+        chosen = random.choice(allowed_modes)  # 随机选 'depth' 或 'flow'
+        if chosen == 'depth':
+            noisy_latents_depth[:, :, 1:, :, :] = torch.randn_like(...)
+        else:
+            noisy_latents_flow[:, :, 1:, :, :] = torch.randn_like(...)
+```
+
+- 以概率 `branch_dropout_prob`（Stage 2: 0.2, Stage 3: 0.05），随机选择 depth 或 flow 之一
+- 将被选中分支的 **非首帧** 噪声潜变量替换为纯随机噪声（首帧保留条件）
+- Video 分支**永远不被 dropout**——它作为"外观锚点"始终提供可靠信息
+- 这迫使 Joint Attention 学习从可见模态重建被遮蔽模态
+
+**Step 8：Classifier-Free Guidance Dropout**（约第 867-868 行）
+
+```python
+if random.random() < 0.15:           # 硬编码 15% 概率
+    text_embedding = null_embedding  # 使用空文本嵌入替换真实文本
+```
+
+这使模型在推理时能使用 CFG 引导：$\hat{v} = v_{uncond} + w \cdot (v_{cond} - v_{uncond})$。概率 0.15 是硬编码的，不可配置。
+
+**Step 9：构建 Per-token Timestep**（约第 870-877 行）
+
+```python
+first_frame_mask = torch.ones(1, 1, num_frames, height, width)
+first_frame_mask[:, :, 0] = 0  # 首帧 timestep = 0（干净信号）
+
+per_token_timestep = first_frame_mask[0][0][:, ::2, ::2] * shifted_timesteps
+```
+
+- 首帧的所有空间位置获得 timestep = 0（表示干净信号）
+- 后续帧获得采样的 timestep $\sigma_t \cdot T$
+- `::2` 下采样匹配 patch 后的空间维度（patch_size = (1,2,2) 的空间步幅）
+
+**Step 10：Transformer 前向传播**（约第 879-888 行）
+
+```python
+video_pred, depth_pred, flow_pred = model(
+    hidden_states       = noisy_latents,       # 噪声 RGB 潜变量
+    hidden_states_depth = noisy_latents_depth,  # 噪声深度潜变量
+    hidden_states_flow  = noisy_latents_flow,   # 噪声光流潜变量
+    timestep            = timestep_input,        # per-token timestep
+    encoder_hidden_states = text_embedding,      # 文本条件（可能已被 CFG dropout）
+    return_dict=False,
+)
+```
+
+模型接受三组噪声潜变量 + 时间步 + 文本条件，返回三个速度预测。
+
+**Step 11：计算 Loss**（约第 890-908 行）
+
+```python
+# 每个分支独立计算 MSE，排除首帧（[:, :, 1:]）
+loss_video = F.mse_loss(video_pred[:, :, 1:].float(), target_video[:, :, 1:].float())
+loss_depth = F.mse_loss(depth_pred[:, :, 1:].float(), target_depth[:, :, 1:].float())
+loss_flow  = F.mse_loss(flow_pred[:, :, 1:].float(),  target_flow[:, :, 1:].float())
+
+# 加权组合
+loss = loss_video + loss_depth + loss_weight_flow * loss_flow
+```
+
+**关键细节**：
+1. **首帧排除**：`[:, :, 1:]` 排除了第 0 帧。因为首帧是干净的条件输入（不含噪声），对其做速度预测没有意义
+2. **FP32 计算**：`.float()` 确保 loss 在 FP32 下计算，避免 bf16 下的数值不稳定
+3. **`reduction="mean"`**：默认的 MSE 均值归约，在所有维度（通道、帧、高、宽）上取平均
+
+**损失系数**：
+
+| 损失项 | 系数 | Stage 1 | Stage 2/3 |
+|--------|------|---------|-----------|
+| `loss_video` | 1.0（固定） | 1.0 | 1.0 |
+| `loss_depth` | 1.0（固定） | 1.0 | 1.0 |
+| `loss_flow` | `loss_weight_flow` | **0.5** | **1.0** |
+
+Stage 1 中光流损失权重为 0.5 的原因：光流的首帧条件（白色图 = 零光流）信息量远低于 RGB 的首帧条件（实际图像），因此降低权重避免其主导训练。
+
+#### 10.2.3 训练数据字段使用汇总
+
+| 数据字段 | 使用步骤 | 用途 |
+|---------|---------|------|
+| `encoded_video` | Step 4, 5 | 构建噪声潜变量、计算速度目标 |
+| `encoded_depth` | Step 4, 5 | 构建噪声潜变量、计算速度目标 |
+| `encoded_flow` | Step 4, 5 | 构建噪声潜变量、计算速度目标 |
+| `img_latent` | Step 6 | RGB 首帧条件替换 |
+| `depth_latent` | Step 6 | 深度首帧条件替换 |
+| `flow_latent` | Step 6 | 光流首帧条件替换 |
+| `text_embedding` | Step 8, 10 | 文本条件信号（可被 CFG dropout） |
+| `null_embedding` | Step 8 | CFG dropout 时替换文本 |
+
+**所有 8 个字段都被完整使用**，没有冗余数据。
+
+### 10.3 Policy 训练数据
+
+#### 10.3.1 数据总览
+
+Policy 训练使用**原始机器人遥操作数据**（视频 + 动作序列），与 World Model 的预计算潜变量方式不同。
+
+```mermaid
+flowchart LR
+    subgraph "磁盘上的 Episode 数据"
+        EP["episode_00001/"]
+        EP --> MP4["observation.images.head.mp4<br/>1280×720, 30fps"]
+        EP --> PQ["timeseries.parquet<br/>action (54-dim), state (54-dim)"]
+        EP --> META["metadata.json<br/>task_prompt, fps"]
+        EP --> DEPTH_V["[可选] depth.mp4<br/>(从 depth_root_dir)"]
+    end
+    
+    subgraph "预计算文本嵌入"
+        TEXT_SF["text_embeddings/pick_up.safetensors<br/>(77, 4096) UMT5 embedding"]
+    end
+    
+    subgraph "TianjiVideoDataset"
+        MP4 --> TRANSFORM["CenterCrop(480,640)<br/>ColorJitter<br/>Normalize → [-1,1]"]
+        PQ --> ACTION["动作提取 + 标准化<br/>(raw - mean) / std"]
+        PQ --> STATE["状态提取<br/>(原始值, 无标准化)"]
+        DEPTH_V --> D_TRANS["CenterCrop + Normalize<br/>(无 ColorJitter)"]
+        TEXT_SF --> LANG["语言嵌入<br/>截取前 32 tokens"]
+    end
+```
+
+#### 10.3.2 Episode 目录结构
+
+每个 episode 对应一次遥操作采集的完整轨迹：
+
+```
+data/tianji_sample/
+├── episode_00001/
+│   ├── observation.images.head.mp4        # 头部摄像头视频 (1280×720, 30fps)
+│   ├── observation.images.left_wrist.mp4  # [可选] 左手腕摄像头
+│   ├── observation.images.right_wrist.mp4 # [可选] 右手腕摄像头
+│   ├── timeseries.parquet                 # 逐帧动作和状态
+│   └── metadata.json                      # {"task_prompt": "...", "fps": 30, ...}
+├── episode_00002/
+│   └── ...
+└── action_stats.json                      # 动作标准化参数 {"mean": [...], "std": [...]}
+```
+
+深度视频存储在独立目录树中（`depth_root_dir`）：
+```
+data/tianji_sample_depth/
+├── episode_00001/exports/mini_npz/depth.mp4
+├── episode_00002/exports/mini_npz/depth.mp4
+└── ...
+```
+
+#### 10.3.3 Parquet 文件内容
+
+`timeseries.parquet` 包含的关键列：
+
+| 列名 | 形状 | 说明 |
+|------|------|------|
+| `action` | `(action_dim,)` per row | 每帧的动作向量，54 维（TIANJI M6 双臂：7-DoF × 2 臂 + 20-DoF × 2 灵巧手 = 54） |
+| `observation.state` | `(state_dim,)` per row | 每帧的本体感知状态，54 维（关节角度/位置） |
+
+#### 10.3.4 `TianjiVideoDataset.__getitem__` 详解
+
+> 源码位置：`rynnworld4d_policy/policy_models/datasets/tianji_dataset.py:205-260`
+
+**样本索引**：在 `__init__` 中预构建了 `(episode_idx, start_frame)` 的索引列表（约第 149-152 行）。对每个 episode，从第 0 帧开始，以 `skip_frames` 为步长，直到 `n_frames - action_seq_len`，生成所有有效起始帧。
+
+**数据加载步骤**：
+
+```python
+# 1. 读取 RGB 视频帧
+video = cv2.VideoCapture(head_mp4_path)
+frame = video.read(start_frame)           # 读取指定帧
+rgb = self.transform(frame)               # CenterCrop + ColorJitter + Normalize[-1,1]
+# → shape: (obs_seq_len, 3, H, W) = (1, 3, 480, 640)
+
+# 2. 读取深度帧（如可用）
+depth_frame = cv2.VideoCapture(depth_mp4_path).read(start_frame)
+depth = self.depth_transform(depth_frame)  # CenterCrop + Normalize[-1,1], 无 ColorJitter
+# → shape: (1, 3, H, W)
+
+# 3. 读取动作序列
+actions_raw = parquet_data["action"][start : start + action_seq_len]
+actions = (actions_raw - self.action_mean) / self.action_std  # 逐维标准化
+# → shape: (10, 54)
+
+# 4. 读取本体感知状态
+state = parquet_data["observation.state"][start]  # 原始值，无标准化
+# → shape: (54,)
+
+# 5. 语言条件
+lang_text_embedding = safetensors.load(text_embedding_path)  # 预计算 UMT5
+# → shape: (seq_len, 4096)
+```
+
+**动作标准化**（约第 156-184 行）：
+
+- 如果 `action_stats.json` 存在，直接加载 `mean` 和 `std`
+- 否则，遍历所有 episodes 计算全局 per-dimension 均值和标准差：
+  ```python
+  mean = all_actions.mean(axis=0)          # shape: (54,)
+  std = max(all_actions.std(axis=0), 1e-6) # shape: (54,), 下限 1e-6
+  ```
+- 标准化公式：$a_{norm} = (a_{raw} - \mu) / \sigma$
+
+**图像增强**：
+
+| 变换 | RGB | 深度 |
+|------|-----|------|
+| CenterCrop(480, 640) | ✓ | ✓ |
+| ColorJitter(0.2, 0.2, 0.2) | ✓ (训练时) | ✗ |
+| ToTensor [0,1] | ✓ | ✓ |
+| Normalize(mean=[0.5]×3, std=[0.5]×3) | ✓ (→ [-1,1]) | ✓ (→ [-1,1]) |
+
+**返回字典完整内容**：
+
+| 键名 | 形状 | 说明 | Loss 计算中的用途 |
+|------|------|------|-----------------|
+| `rgb_obs["rgb_static"]` | `(1, 3, 480, 640)` | 头部摄像头 RGB 帧 | 输入 WanFeatureExtractor 提取 4D 特征 |
+| `depth_static` | `(1, 3, 480, 640)` | 深度帧（如可用） | 深度分支条件 |
+| `state` | `(54,)` | 本体感知（原始值） | 输入 DiffusionTransformer 的 proprio_emb |
+| `actions` | `(10, 54)` | 标准化后的未来动作 | Flow Matching 的目标（$x_1$） |
+| `lang_text_embedding` | `(seq, 4096)` | 预计算 UMT5 文本嵌入 | 输入 DiffusionTransformer 的 goal_emb |
+| `idx` | `int` | 样本索引 | 仅用于日志 |
+
+#### 10.3.5 TianjiDataModule 数据划分
+
+> 源码位置：`tianji_dataset.py:289-398`
+
+数据按**episode 级别**划分（而非 sample 级别）：前 90% 的 episodes 用于训练，后 10% 用于验证。这确保了验证集包含完整的、未见过的轨迹。
+
+### 10.4 Policy Loss 计算
+
+#### 10.4.1 训练步完整流程
+
+> 源码位置：`rynnworld4d_policy/policy_models/vpp_policy.py:192-267`
+
+```mermaid
+sequenceDiagram
+    participant BATCH as Training Batch
+    participant VPP as VPP_Policy
+    participant WFE as WanFeatureExtractor<br/>(frozen ~5B params)
+    participant VF as Video_Former_3D<br/>(trainable)
+    participant FM as FlowMatchingPolicy<br/>(trainable)
+    participant DT as DiffusionTransformer
+    
+    Note over VPP: training_step (line 192)
+    BATCH->>VPP: dataset_batch
+    VPP->>VPP: extract_predictive_feature()
+    
+    Note over VPP: Step A: 提取视觉特征
+    VPP->>WFE: rgb_static, depth_cond, text_emb, timestep=500
+    
+    Note over WFE: _build_rynnworld4d_latents()
+    WFE->>WFE: VAE encode RGB frame[0] → video_latent
+    WFE->>WFE: DA3/precomputed depth → depth_latent
+    WFE->>WFE: White image → flow_latent (零光流)
+    WFE->>WFE: 构建三分支: frame[0]=条件, frame[1:20]=noise
+    
+    Note over WFE: _transformer_step_rynnworld4d()
+    WFE->>WFE: RynnWorld4D forward (block 0-19, 冻结)
+    WFE->>WFE: Hook 捕获 block 15 输出
+    WFE->>WFE: cat(video, depth, flow) → (B, 3N, 3072)
+    WFE->>WFE: Reshape → (B, 21, 9216, H_tok, W_tok)
+    WFE-->>VPP: perceptual_features (B, 21, H×W, 9216)
+    
+    Note over VPP: Step B: Perceiver 压缩
+    VPP->>VF: perceptual_features (B, 21, spatial, 9216)
+    VF-->>VPP: compressed (B, 336, 384)
+    
+    Note over VPP: Step C: 组装 predictive_feature
+    VPP->>VPP: state_images = compressed
+    VPP->>VPP: state_obs = batch["state"]
+    VPP->>VPP: latent_goal = text_emb[:, :32, :]
+    
+    Note over FM: Step D: Flow Matching Loss
+    VPP->>FM: loss(predictive_feature, actions, latent_goal)
+    
+    FM->>FM: t ~ U(1e-4, 1.0), noise ~ N(0,I)
+    FM->>FM: x_t = (1-t)·noise + t·actions
+    FM->>FM: v_target = actions - noise
+    FM->>DT: predict_velocity(state, x_t, goal, t)
+    
+    Note over DT: Encoder-Decoder 前向
+    DT->>DT: Encoder: cat[goal_emb, tok_emb(state), proprio_emb]
+    DT->>DT: Decoder: action_emb(x_t) + σ_emb(t) → FiLM
+    DT-->>FM: v_pred (B, 10, 54)
+    
+    FM->>FM: loss = MSE(v_pred, v_target)
+    FM-->>VPP: loss scalar
+```
+
+#### 10.4.2 `FlowMatchingPolicy.loss` 逐行解析
+
+> 源码位置：`rynnworld4d_policy/policy_models/edm_diffusion/flow_matching.py:105-120`
+
+```python
+def loss(self, state, actions, goal):
+    B = actions.shape[0]                                    # batch size
+
+    # 1. 采样 flow time t ∈ (0, 1]
+    t = torch.rand(B, device=actions.device).clamp(1e-4, 1.0)  # 下限 1e-4 避免数值问题
+
+    # 2. 采样高斯噪声
+    noise = torch.randn_like(actions)                       # shape: (B, 10, 54)
+
+    # 3. 线性插值构建噪声动作
+    t_expand = t.view(B, 1, 1)                              # 广播形状
+    x_t = (1 - t_expand) * noise + t_expand * actions       # t=0: 纯噪声, t=1: 纯数据
+
+    # 4. 目标速度
+    v_target = actions - noise                              # 从噪声到数据的直线方向
+
+    # 5. 网络预测速度
+    v_pred = self.predict_velocity(state, x_t, goal, t)     # → (B, 10, 54)
+
+    # 6. MSE 损失
+    return F.mse_loss(v_pred, v_target), v_pred
+```
+
+**数学形式**：
+
+给定标准化动作 $x_1 = a_{norm} \in \mathbb{R}^{10 \times 54}$ 和噪声 $\epsilon \sim \mathcal{N}(0, I)$：
+
+$$x_t = (1 - t)\epsilon + t \cdot x_1, \quad t \sim \text{Uniform}(10^{-4}, 1)$$
+
+$$v_{target} = x_1 - \epsilon$$
+
+$$\mathcal{L}_{policy} = \mathbb{E}_{t, \epsilon} \left[ \| v_\theta(x_t, t, \text{state}, \text{goal}) - v_{target} \|^2 \right]$$
+
+**与 World Model 的 Flow Matching 对比**：
+
+| 对比项 | World Model | Policy |
+|--------|-------------|--------|
+| 插值方向 | $z_t = (1-\sigma)z_0 + \sigma \epsilon$ | $x_t = (1-t)\epsilon + t \cdot x_1$ |
+| 目标速度 | $v = \epsilon - z_0$（noise - clean） | $v = x_1 - \epsilon$（data - noise） |
+| 时间步采样 | 离散均匀 + flow-shift | 连续均匀 $t \sim U(10^{-4}, 1)$ |
+| 首帧排除 | 是（排除 frame[0]） | 否（所有时间步参与） |
+| 噪声策略 | 三分支共享噪声 | 独立噪声 |
+
+两者在数学上等价（方向相反），但使用了不同的参数化约定。
+
+#### 10.4.3 `predict_velocity` 内部流程
+
+> 源码位置：`flow_matching.py:76-103`
+
+```python
+def predict_velocity(self, state, x_t, goal, t):
+    # 1. 时间嵌入: t ∈ [0,1] → t*5.0 → SinusoidalPosEmb → MLP → (B, 1, 384)
+    emb_t = self._encode_time(t)
+    
+    # 2. Encoder: 编码上下文
+    #    goal_embed  = lang_emb(goal[:, :32, :]) → (B, 32, 384)
+    #    state_embed = tok_emb(state_images)     → (B, 336, 384)
+    #    proprio_embed = proprio_emb(state_obs)  → (B, 1, 384)
+    #    context = Encoder([goal; state; proprio]) → (B, 369, 384)
+    
+    # 3. Decoder: 预测速度
+    #    action_input = action_emb(x_t) → (B, 10, 384)
+    #    v_pred = Decoder(action_input, context, emb_t) → (B, 10, 384)
+    #    v_pred = action_pred(v_pred) → (B, 10, 54)
+    return v_pred
+```
+
+**输入数据在 `predict_velocity` 中的使用**：
+
+| 数据 | 来源 | 投影 | Encoder/Decoder |
+|------|------|------|----------------|
+| `goal` (32, 4096) | `text_embedding[:, :32]` | `lang_emb` MLP: 4096→768→384 | Encoder 输入 |
+| `state_images` (336, 384) | Video_Former 压缩的 4D 特征 | `tok_emb` Linear: 384→384 | Encoder 输入 |
+| `state_obs` (54,) | `batch["state"]` 本体感知 | `proprio_emb` MLP: 54→768→384 | Encoder 输入 |
+| `x_t` (10, 54) | 噪声动作（插值结果） | `action_emb` Linear: 54→384 | Decoder 输入 |
+| `t` (标量) | 采样的 flow time | `sigma_emb` Sinusoidal+MLP | Decoder FiLM 条件 |
+
+#### 10.4.4 训练 vs 验证的差异
+
+> 源码位置：`vpp_policy.py:199-211`
+
+| 对比项 | `training_step` | `validation_step` |
+|--------|----------------|-------------------|
+| 调用方法 | `model.loss(state, actions, goal)` | `model.sample(state, goal, shape, n_steps=4)` |
+| 输出 | Flow matching MSE loss（标量） | 预测动作序列 `(B, 10, 54)` |
+| 评估指标 | training loss（训练损失） | MSE(pred_actions, gt_actions)（动作预测误差） |
+| 梯度 | 有（反向传播） | 无（`@torch.no_grad()`） |
+| ODE 步数 | 不适用（直接计算损失） | 4 步 Euler 积分 |
+
+验证时的 `sample` 方法执行 4 步 Euler ODE 积分：
+
+```python
+x = torch.randn(B, 10, 54)             # 从纯噪声开始
+dt = 1.0 / 4                            # 步长 0.25
+for i in range(4):                       # t = 0, 0.25, 0.5, 0.75
+    t = torch.full((B,), i * dt)
+    v = predict_velocity(state, x, goal, t)
+    x = x + v * dt                       # Euler 前进
+# x ≈ 预测的标准化动作
+```
+
+验证 MSE 是在**标准化空间**中计算的（预测动作 vs 标准化的真实动作），与训练损失在相同空间中，具有可比性。
+
+#### 10.4.5 Policy 训练数据字段使用汇总
+
+| 数据字段 | 处理模块 | 最终用途 |
+|---------|---------|---------|
+| `rgb_obs["rgb_static"]` | WanFeatureExtractor → VAE encode → Transformer → Hook | 4D 视觉特征提取 |
+| `depth_static` | WanFeatureExtractor → VAE encode → Transformer depth 分支 | 深度分支条件 |
+| `state` | 直接传入 DiffusionTransformer `proprio_emb` | 本体感知条件 |
+| `actions` | Flow Matching 的 $x_1$（数据端点） | 速度目标 $v = x_1 - \epsilon$ |
+| `lang_text_embedding` | 截取前 32 tokens → DiffusionTransformer `lang_emb` | 语言目标条件 |
+| `idx` | 仅日志 | — |
+
+---
+
 ## 参考来源
 
 - **论文**: Zhao et al., "RynnWorld-4D: 4D Embodied World Models for Robotic Manipulation", arXiv 2607.06559
